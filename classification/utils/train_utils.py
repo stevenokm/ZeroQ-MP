@@ -1,4 +1,4 @@
-#*
+# *
 # @file Different utility functions
 # Copyright (c) Yaohui Cai, Zhewei Yao, Zhen Dong, Amir Gholami
 # All rights reserved.
@@ -16,7 +16,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with ZeroQ repository.  If not, see <http://www.gnu.org/licenses/>.
-#*
+# *
 
 import torch
 import os
@@ -29,7 +29,7 @@ def test(model, test_loader):
     test a model on a given dataset
     """
     total, correct = 0, 0
-    bar = Bar('Testing', max=len(test_loader))
+    bar = Bar("Testing", max=len(test_loader))
     model.eval()
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(test_loader):
@@ -40,9 +40,9 @@ def test(model, test_loader):
             correct += predicted.eq(targets).sum().item()
             acc = correct / total
 
-            bar.suffix = f'({batch_idx + 1}/{len(test_loader)}) | ETA: {bar.eta_td} | top1: {acc}'
+            bar.suffix = f"({batch_idx + 1}/{len(test_loader)}) | ETA: {bar.eta_td} | top1: {acc}"
             bar.next()
-    print('\nFinal acc: %.2f%% (%d/%d)' % (100. * acc, correct, total))
+    print("\nFinal acc: %.2f%% (%d/%d)" % (100.0 * acc, correct, total))
     bar.finish()
     model.train()
     return acc
@@ -51,7 +51,7 @@ def test(model, test_loader):
 def update(quantized_model, distilD):
     """
     Update activation range according to distilled data
-    quantized_model: a quantized model whose activation range to be updated 
+    quantized_model: a quantized model whose activation range to be updated
     distilD: distilled data
     """
     with torch.no_grad():
@@ -60,6 +60,6 @@ def update(quantized_model, distilD):
                 inputs = inputs[0]
             inputs = inputs.cuda()
             outputs = quantized_model(inputs)
-            print('only calibrate the quantization parameters on one batch')
+            print("only calibrate the quantization parameters on one batch")
             break
     return quantized_model

@@ -26,14 +26,16 @@ from pytorchcv.models.common import ConvBlock
 from pytorchcv.models.shufflenetv2 import ShuffleUnit, ShuffleInitBlock
 
 
-class QuanModel():
-    def __init__(self, percentile):
+class QuanModel:
+    def __init__(self, percentile, per_channel=False, tile_size=None):
         # collect convq, linearq and actq for sensitivity analysis.
         self.quan_act_layers = []
         self.quan_weight_layers = []
-        self.weight_num = [] # TODO
+        self.weight_num = []  # TODO
         self.percentile = percentile
- 
+        self.per_channel = per_channel
+        self.tile_size = tile_size
+
     def quantize_model(self, model):
         """
         Recursively quantize a pretrained single-precision model to int8 quantized model
@@ -41,7 +43,12 @@ class QuanModel():
         """
         # quantize convolutional and linear layers to 8-bit
         if type(model) == nn.Conv2d:
-            quant_mod = Quant_Conv2d(weight_bit=8, percentile=None)
+            quant_mod = Quant_Conv2d(
+                weight_bit=8,
+                percentile=None,
+                per_channel=self.per_channel,
+                tile_size=self.tile_size,
+            )
             quant_mod.set_param(model)
             self.quan_weight_layers.append(quant_mod)
             self.weight_num.append(quant_mod.weight.numel())
@@ -55,7 +62,12 @@ class QuanModel():
 
         # quantize all the activation to 8-bit
         elif type(model) == nn.ReLU or type(model) == nn.ReLU6:
-            quant_mod = QuantAct(activation_bit=8, percentile=self.percentile)
+            quant_mod = QuantAct(
+                activation_bit=8,
+                percentile=self.percentile,
+                per_channel=self.per_channel,
+                tile_size=self.tile_size,
+            )
             self.quan_act_layers.append(quant_mod)
             return nn.Sequential(*[model, quant_mod])
 
@@ -69,7 +81,7 @@ class QuanModel():
             q_model = copy.deepcopy(model)
             for attr in dir(model):
                 mod = getattr(model, attr)
-                if isinstance(mod, nn.Module) and 'norm' not in attr:
+                if isinstance(mod, nn.Module) and "norm" not in attr:
                     setattr(q_model, attr, self.quantize_model(mod))
             return q_model
 
@@ -87,7 +99,7 @@ def freeze_model(model):
     else:
         for attr in dir(model):
             mod = getattr(model, attr)
-            if isinstance(mod, nn.Module) and 'norm' not in attr:
+            if isinstance(mod, nn.Module) and "norm" not in attr:
                 freeze_model(mod)
         return model
 
@@ -105,6 +117,6 @@ def unfreeze_model(model):
     else:
         for attr in dir(model):
             mod = getattr(model, attr)
-            if isinstance(mod, nn.Module) and 'norm' not in attr:
+            if isinstance(mod, nn.Module) and "norm" not in attr:
                 unfreeze_model(mod)
         return model

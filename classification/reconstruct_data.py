@@ -1,4 +1,4 @@
-#*
+# *
 # @file Different utility functions
 # Copyright (c) Yaohui Cai, Zhewei Yao, Zhen Dong, Amir Gholami
 # All rights reserved.
@@ -16,7 +16,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with ZeroQ repository.  If not, see <http://www.gnu.org/licenses/>.
-#*
+# *
 
 import os
 import json
@@ -29,16 +29,17 @@ from utils import *
 
 def own_loss(A, B):
     """
-	L-2 loss between A and B normalized by length.
-	A and B should have the same length
-	"""
-    return (A - B).norm()**2 / A.size(0)
+    L-2 loss between A and B normalized by length.
+    A and B should have the same length
+    """
+    return (A - B).norm() ** 2 / A.size(0)
 
 
 class output_hook(object):
     """
-	Forward_hook used to get the output of intermediate layer. 
-	"""
+    Forward_hook used to get the output of intermediate layer.
+    """
+
     def __init__(self):
         super(output_hook, self).__init__()
         self.outputs = None
@@ -50,26 +51,22 @@ class output_hook(object):
         self.outputs = None
 
 
-def getReconData(teacher_model,
-                 dataset,
-                 batch_size,
-                 num_batch=1,
-                 for_inception=False):
+def getReconData(teacher_model, dataset, batch_size, num_batch=1, for_inception=False):
     """
-	Generate distilled data according to the BatchNorm statistics in pretrained single-precision model.
-	Only support single GPU.
+    Generate distilled data according to the BatchNorm statistics in pretrained single-precision model.
+    Only support single GPU.
 
-	teacher_model: pretrained single-precision model
-	dataset: the name of dataset
-	batch_size: the batch size of generated distilled data
-	num_batch: the number of batch of generated distilled data
-	for_inception: whether the data is for Inception because inception has input size 299 rather than 224
-	"""
+    teacher_model: pretrained single-precision model
+    dataset: the name of dataset
+    batch_size: the batch size of generated distilled data
+    num_batch: the number of batch of generated distilled data
+    for_inception: whether the data is for Inception because inception has input size 299 rather than 224
+    """
 
     # initialize distilled data with random noise according to the dataset
-    dataloader = getRandomData(dataset=dataset,
-                               batch_size=batch_size,
-                               for_inception=for_inception)
+    dataloader = getRandomData(
+        dataset=dataset, batch_size=batch_size, for_inception=for_inception
+    )
 
     eps = 1e-6
     # initialize hooks and single-precision model
@@ -78,10 +75,12 @@ def getReconData(teacher_model,
     teacher_model = teacher_model.eval()
 
     # get number of BatchNorm layers in the model
-    layers = sum([
-        1 if isinstance(layer, nn.BatchNorm2d) else 0
-        for layer in teacher_model.modules()
-    ])
+    layers = sum(
+        [
+            1 if isinstance(layer, nn.BatchNorm2d) else 0
+            for layer in teacher_model.modules()
+        ]
+    )
 
     for n, m in teacher_model.named_modules():
         if isinstance(m, nn.Conv2d) and len(hook_handles) < layers:
@@ -92,9 +91,11 @@ def getReconData(teacher_model,
         if isinstance(m, nn.BatchNorm2d):
             # get the statistics in the BatchNorm layers
             bn_stats.append(
-                (m.running_mean.detach().clone().flatten().cuda(),
-                 torch.sqrt(m.running_var +
-                            eps).detach().clone().flatten().cuda()))
+                (
+                    m.running_mean.detach().clone().flatten().cuda(),
+                    torch.sqrt(m.running_var + eps).detach().clone().flatten().cuda(),
+                )
+            )
     assert len(hooks) == len(bn_stats)
 
     for i, gaussian_data in enumerate(dataloader):
@@ -105,10 +106,9 @@ def getReconData(teacher_model,
         gaussian_data.requires_grad = True
         crit = nn.CrossEntropyLoss().cuda()
         optimizer = optim.Adam([gaussian_data], lr=0.1)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
-                                                         min_lr=1e-4,
-                                                         verbose=False,
-                                                         patience=100)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, min_lr=1e-4, verbose=False, patience=100
+        )
 
         input_mean = torch.zeros(1, 3).cuda()
         input_std = torch.ones(1, 3).cuda()
@@ -126,21 +126,24 @@ def getReconData(teacher_model,
             for cnt, (bn_stat, hook) in enumerate(zip(bn_stats, hooks)):
                 tmp_output = hook.outputs
                 bn_mean, bn_std = bn_stat[0], bn_stat[1]
-                tmp_mean = torch.mean(tmp_output.view(tmp_output.size(0),
-                                                      tmp_output.size(1), -1),
-                                      dim=2)
+                tmp_mean = torch.mean(
+                    tmp_output.view(tmp_output.size(0), tmp_output.size(1), -1), dim=2
+                )
                 tmp_std = torch.sqrt(
-                    torch.var(tmp_output.view(tmp_output.size(0),
-                                              tmp_output.size(1), -1),
-                              dim=2) + eps)
+                    torch.var(
+                        tmp_output.view(tmp_output.size(0), tmp_output.size(1), -1),
+                        dim=2,
+                    )
+                    + eps
+                )
                 mean_loss += own_loss(bn_mean, tmp_mean)
                 std_loss += own_loss(bn_std, tmp_std)
-            tmp_mean = torch.mean(gaussian_data.view(gaussian_data.size(0), 3,
-                                                     -1),
-                                  dim=2)
+            tmp_mean = torch.mean(
+                gaussian_data.view(gaussian_data.size(0), 3, -1), dim=2
+            )
             tmp_std = torch.sqrt(
-                torch.var(gaussian_data.view(gaussian_data.size(0), 3, -1),
-                          dim=2) + eps)
+                torch.var(gaussian_data.view(gaussian_data.size(0), 3, -1), dim=2) + eps
+            )
             mean_loss += own_loss(tmp_mean, input_mean)
             std_loss += own_loss(tmp_std, input_std)
             total_loss = mean_loss + std_loss
