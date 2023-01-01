@@ -55,22 +55,23 @@ class QuantAct(Module):
         self.running_stat = running_stat
         if per_channel:
             assert tile_size == None
-            # pre-allocate the min/max buffer for per-channel quantization
-            self.register_buffer("x_min", torch.zeros(1024))
-            self.register_buffer("x_max", torch.zeros(1024))
+            self.buffer_size = 1024
             self.act_function = AsymmetricQuantPerChannelFunction.apply
         elif tile_size is not None:
             assert not per_channel
-            # pre-allocate the min/max buffer for per-channel quantization
-            self.register_buffer("x_min", torch.zeros(65536))
-            self.register_buffer("x_max", torch.zeros(65536))
+            self.buffer_size = (
+                8192 * math.ceil(256 / tile_size) * math.ceil(self.bit / 8)
+            )
             self.act_function = AsymmetricQuantPerTileFunction.apply
         else:
-            self.register_buffer("x_min", torch.zeros(1))
-            self.register_buffer("x_max", torch.zeros(1))
+            self.buffer_size = 1
             self.act_function = AsymmetricQuantFunction.apply
+        # pre-allocate the min/max buffer for per-channel quantization
+        self.register_buffer("x_min", torch.zeros(self.buffer_size))
+        self.register_buffer("x_max", torch.zeros(self.buffer_size))
         self.per_channel_quant = per_channel
         self.tile_size = tile_size
+        self.output_bits = None
 
     def __repr__(self):
         return "{0}(activation_bit={1}, full_precision_flag={2}, running_stat={3}, Act_min: {4:.2f}, Act_max: {5:.2f})".format(
@@ -95,10 +96,11 @@ class QuantAct(Module):
         """
         quantize given activation x
         """
+        self.output_nums = x.numel()
         padding_minmax = 0
         if self.per_channel_quant:
             channels = x.shape[1]
-            padding_minmax = 1024 - channels
+            padding_minmax = self.buffer_size - channels
             assert padding_minmax >= 0
         elif self.tile_size is not None:
             elements_per_tile = self.tile_size * 8 // self.bit
@@ -113,7 +115,7 @@ class QuantAct(Module):
                 )
             x_padded = x_padded.view(x_padded.shape[0], -1, elements_per_tile)
             number_of_tiles = x_padded.shape[1]
-            assert number_of_tiles <= 65536
+            assert number_of_tiles <= self.buffer_size
 
         if self.full_precision_flag:
             return x
@@ -122,7 +124,7 @@ class QuantAct(Module):
                 x_transform = x.data.transpose(0, 1).contiguous().view(channels, -1)
                 flat_dim = 1
             elif self.tile_size is not None:
-                padding_minmax = 65536 - number_of_tiles
+                padding_minmax = self.buffer_size - number_of_tiles
                 x_transform = (
                     x_padded.transpose(0, 1).contiguous().view(number_of_tiles, -1)
                 )
@@ -251,7 +253,7 @@ class Quant_Conv2d(Module):
             "("
             + s
             + " weight_bit={}, full_precision_flag={})".format(
-                self.bit, self.full_precision_flag
+                torch.max(self.bit), self.full_precision_flag
             )
         )
         return s
@@ -269,6 +271,11 @@ class Quant_Conv2d(Module):
             self.bias = Parameter(conv.bias.data.clone())
         except AttributeError:
             self.bias = None
+        if self.tile_size is not None:
+            self.elements_per_tile = self.tile_size * 8 // self.bit
+            self.tile_nums = math.ceil(
+                self.weight.numel() // self.weight.shape[0] / self.elements_per_tile
+            )
 
     def forward(self, x):
         """
@@ -280,22 +287,20 @@ class Quant_Conv2d(Module):
                 x, w, self.bias, self.stride, self.padding, self.dilation, self.groups
             )
         if self.per_channel_quant:
-            x_transform = w.data.contiguous().view(
-                self.out_channels, self.in_channels, -1
-            )
-            flat_dim = 2
+            x_transform = w.data.contiguous().view(self.out_channels, -1)
+            flat_dim = 1
         elif self.tile_size is not None:
-            elements_per_tile = self.tile_size * 8 // self.bit
             x_flatten = w.data.contiguous().view(self.out_channels, -1)
-            padding_elements = elements_per_tile - (
-                x_flatten.shape[1] % elements_per_tile
+            padding_elements = self.elements_per_tile - (
+                x_flatten.shape[1] % self.elements_per_tile
             )
             x_padded = x_flatten
-            if padding_elements != elements_per_tile:
+            if padding_elements != self.elements_per_tile:
                 x_padded = torch.nn.functional.pad(
                     x_flatten, (0, padding_elements), "constant", 0
                 )
-            x_padded = x_padded.view(x_padded.shape[0], -1, elements_per_tile)
+            x_padded = x_padded.view(x_padded.shape[0], -1, self.elements_per_tile)
+            assert x_padded.shape[1] == self.tile_nums
             x_transform = x_padded
             flat_dim = 2
         else:
@@ -308,7 +313,12 @@ class Quant_Conv2d(Module):
             w_max = x_transform.max(dim=flat_dim).values
         if self.tile_size is not None:
             w = self.weight_function(
-                self.weight, self.bit, w_min, w_max, self.tile_size
+                self.weight,
+                self.bit,
+                w_min,
+                w_max,
+                self.tile_size,
+                self.elements_per_tile,
             )
         else:
             w = self.weight_function(self.weight, self.bit, w_min, w_max)

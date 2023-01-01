@@ -36,7 +36,7 @@ class QuanModel:
         self.per_channel = per_channel
         self.tile_size = tile_size
 
-    def quantize_model(self, model):
+    def quantize_model(self, model, init_w_bit=8, init_a_bit=8):
         """
         Recursively quantize a pretrained single-precision model to int8 quantized model
         model: pretrained single-precision model
@@ -44,7 +44,7 @@ class QuanModel:
         # quantize convolutional and linear layers to 8-bit
         if type(model) == nn.Conv2d:
             quant_mod = Quant_Conv2d(
-                weight_bit=8,
+                weight_bit=init_w_bit,
                 percentile=None,
                 per_channel=self.per_channel,
                 tile_size=self.tile_size,
@@ -54,7 +54,7 @@ class QuanModel:
             self.weight_num.append(quant_mod.weight.numel())
             return quant_mod
         elif type(model) == nn.Linear:
-            quant_mod = Quant_Linear(weight_bit=8, percentile=None)
+            quant_mod = Quant_Linear(weight_bit=init_w_bit, percentile=None)
             quant_mod.set_param(model)
             self.quan_weight_layers.append(quant_mod)
             self.weight_num.append(quant_mod.weight.numel())
@@ -63,7 +63,7 @@ class QuanModel:
         # quantize all the activation to 8-bit
         elif type(model) == nn.ReLU or type(model) == nn.ReLU6:
             quant_mod = QuantAct(
-                activation_bit=8,
+                activation_bit=init_a_bit,
                 percentile=self.percentile,
                 per_channel=self.per_channel,
                 tile_size=self.tile_size,
@@ -75,14 +75,16 @@ class QuanModel:
         elif type(model) == nn.Sequential:
             mods = []
             for n, m in model.named_children():
-                mods.append(self.quantize_model(m))
+                mods.append(self.quantize_model(m, init_w_bit, init_a_bit))
             return nn.Sequential(*mods)
         else:
             q_model = copy.deepcopy(model)
             for attr in dir(model):
                 mod = getattr(model, attr)
                 if isinstance(mod, nn.Module) and "norm" not in attr:
-                    setattr(q_model, attr, self.quantize_model(mod))
+                    setattr(
+                        q_model, attr, self.quantize_model(mod, init_w_bit, init_a_bit)
+                    )
             return q_model
 
 

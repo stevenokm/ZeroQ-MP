@@ -21,6 +21,7 @@
 import argparse
 import random
 
+from tqdm import tqdm
 import numpy as np
 import plotly.graph_objects as go
 import torch
@@ -87,6 +88,12 @@ def arg_parse():
         default=None,
         help="tile size (Byte) for per tile quantization",
     )
+    parser.add_argument(
+        "--sensitivity_constraint",
+        type=float,
+        default=1e-2,
+        help="sensitivity constraint for quantization (1 + input)",
+    )
     args = parser.parse_args()
     return args
 
@@ -100,23 +107,40 @@ def symmetric_kl(P, Q):
     return (kl_divergence(P, Q) + kl_divergence(Q, P)) / 2
 
 
-def plot_sen(sen, arch):
-    trace0 = go.Scatter(y=sen[0], mode="lines + markers", name="2bit")
-    trace1 = go.Scatter(y=sen[1], mode="lines + markers", name="4bit")
-    trace2 = go.Scatter(y=sen[2], mode="lines + markers", name="8bit")
-    data = [trace0, trace1, trace2]
+def plot_sen(sen, arch, tile_size=None, per_channel=False):
+    if per_channel:
+        xaxis = "{} channel id".format(arch)
+        title = "{} per channel".format(arch, tile_size)
+    elif tile_size is not None:
+        xaxis = "{} tile id".format(arch)
+        title = "{} tile size = {}".format(arch, tile_size)
+    else:
+        xaxis = "{} layer id".format(arch)
+        title = "{}".format(arch)
+    trace = []
+    for i in range(len(bits_candidate)):
+        trace.append(
+            go.Scatter(
+                y=sen[i], mode="lines + markers", name="{}bit".format(bits_candidate[i])
+            )
+        )
+    data = trace
 
     layout = go.Layout(
-        title="{}".format(arch),
-        xaxis=dict(
-            title="{} layer id".format(arch),
-        ),
+        title=title,
+        xaxis=dict(title=xaxis),
         yaxis=dict(title="sensitivity of quantization", type="log"),
     )
     fig = go.Figure(data, layout)
     if not os.path.exists("workspace/images"):
         os.makedirs("workspace/images")
-    fig.write_image("workspace/images/{}_sen.png".format(arch))
+    if per_channel:
+        file_name = "workspace/images/{}_sen_per_channel.png".format(arch)
+    elif tile_size is not None:
+        file_name = "workspace/images/{}_sen_{}B.png".format(arch, tile_size)
+    else:
+        file_name = "workspace/images/{}_sen.png".format(arch)
+    fig.write_image(file_name)
 
 
 def random_sample(sen_result, quan_weight, weight_num):
@@ -229,63 +253,133 @@ def sensitivity_anylysis(
             gt_output = F.softmax(gt_output, dim=1)
             break
     # 2. change bitwidth layer by layer and get the sensitivity
-    sen_result = [[0 for i in range(len(quan_weight))] for j in range(3)]
-    for i in range(len(quan_weight)):
-        for j, bit in enumerate([2, 4, 8]):
-            quan_weight[i].full_precision_flag = False
-            quan_weight[i].bit = bit
-            with torch.no_grad():
-                tmp_output = quantized_model(inputs)
-                tmp_output = F.softmax(tmp_output, dim=1)
-                kl_div = symmetric_kl(tmp_output, gt_output)
-            sen_result[j][i] = kl_div.item()
-            quan_weight[i].full_precision_flag = True
-    plot_sen(sen_result, args.model)
-    # 3. Pareto Frontier
-    ## random
-    sizes = []
-    sens = []
-    for i in range(1000):
-        size, sen = random_sample(sen_result, quan_weight, weight_num)
-        sizes.append(size)
-        sens.append(sen)
-    trace_random = go.Scatter(x=sizes, y=sens, mode="markers", name="random")
-    layout = go.Layout(
-        title="{}".format(args.model),
-        xaxis=dict(
-            title="{} size (MB)".format(args.model),
-        ),
-        yaxis=dict(title="sensitivity", type="log"),
-    )
+    if args.per_channel:
+        assert args.tile_size == None
+        total_channels = 0
+        conv_layers = []
+        for l in quan_weight:
+            if type(l) == Quant_Conv2d:
+                total_channels += l.out_channels
+                conv_layers.append(l)
+        sen_result = [
+            [0 for i in range(total_channels)] for k in range(len(bits_candidate))
+        ]
+        channel_start_id = 0
+        with tqdm(total=total_channels) as pbar:
+            for l in conv_layers:
+                for out_channel_idx in range(l.out_channels):
+                    bit_array = torch.full((l.out_channels,), 32, device="cuda")
+                    for k, bit in enumerate(bits_candidate):
+                        l.full_precision_flag = False
+                        bit_array[out_channel_idx] = bit
+                        l.bit = bit_array
+                        with torch.no_grad():
+                            tmp_output = quantized_model(inputs)
+                            tmp_output = F.softmax(tmp_output, dim=1)
+                            l2_loss = F.mse_loss(tmp_output, gt_output)
+                        sen_result[k][
+                            channel_start_id + out_channel_idx
+                        ] = l2_loss.item()
+                        l.full_precision_flag = True
+                    pbar.update(1)
+                channel_start_id += l.out_channels
+        plot_sen(sen_result, args.model, per_channel=args.per_channel)
+    elif args.tile_size != None:
+        assert args.per_channel == False
+        total_tiles = 0
+        conv_layers = []
+        for l in quan_weight:
+            if type(l) == Quant_Conv2d:
+                total_tiles += l.tile_nums
+                conv_layers.append(l)
+        sen_result = [
+            [0 for i in range(total_tiles)] for k in range(len(bits_candidate))
+        ]
+        tile_start_id = 0
+        with tqdm(total=total_tiles) as pbar:
+            for l in conv_layers:
+                for tile_offset in range(l.tile_nums):
+                    bit_array = torch.full((l.tile_nums,), 32, device="cuda")
+                    for k, bit in enumerate(bits_candidate):
+                        l.full_precision_flag = False
+                        bit_array[tile_offset] = bit
+                        l.bit = bit_array
+                        with torch.no_grad():
+                            tmp_output = quantized_model(inputs)
+                            tmp_output = F.softmax(tmp_output, dim=1)
+                            l2_loss = F.mse_loss(tmp_output, gt_output)
+                        sen_result[k][tile_start_id + tile_offset] = l2_loss.item()
+                        l.full_precision_flag = True
+                    pbar.update(1)
+                tile_start_id += l.tile_nums
+        plot_sen(sen_result, args.model, tile_size=args.tile_size)
+    else:
+        sen_result = [
+            [0 for i in range(len(quan_weight))] for j in range(len(bits_candidate))
+        ]
+        for i in range(len(quan_weight)):
+            for j, bit in enumerate(bits_candidate):
+                quan_weight[i].full_precision_flag = False
+                quan_weight[i].bit = bit
+                with torch.no_grad():
+                    tmp_output = quantized_model(inputs)
+                    tmp_output = F.softmax(tmp_output, dim=1)
+                    l2_loss = F.mse_loss(tmp_output, gt_output)
+                sen_result[j][i] = l2_loss.item()
+                quan_weight[i].full_precision_flag = True
+        plot_sen(sen_result, args.model)
+    # 3. Heruistic, minimize the total memory size under sensitivity constraint
+    total_sensority_8bit = sum(sen_result[-1])
+    sensitivity_constraint = total_sensority_8bit * (1.0 + args.sensitivity_constraint)
+    current_sensitivity = total_sensority_8bit
+    current_bits = [(len(sen_result) - 1) for i in range(len(sen_result[-1]))]
+    # from least sensitive to most sensitive
+    # from less bits to more bits
     begin = time.time()
-    ## DP
-    node_list = get_FrontierFrontier(sen_result, len(quan_weight), weight_num)
-    print("dp cost: {:.2f}s".format(time.time() - begin))
-    sizes = [x.cost for x in node_list]
-    sens = [-x.profit for x in node_list]
-    trace = go.Scatter(
-        x=sizes,
-        y=sens,
-        mode="markers+lines",
-        name="Frontier Frontier",
-        marker={"size": 3},
-    )
-    data = [trace, trace_random]
-    fig = go.Figure(data, layout)
-    fig.write_image("workspace/images/{}_Pareto.png".format(args.model))
-    fig.write_image("workspace/images/{}_Pareto.pdf".format(args.model))
+    with tqdm(total=(len(sen_result) * len(sen_result[-1]))) as pbar:
+        for i in range(len(bits_candidate)):
+            # sort the sensitivity from large to small
+            sort_sensority_idx = np.argsort(sen_result[i])[::-1]
+            for j in sort_sensority_idx:
+                current_select = current_bits[j]
+                if (
+                    current_sensitivity
+                    - sen_result[current_select][j]
+                    + sen_result[i][j]
+                    < sensitivity_constraint
+                ):
+                    current_sensitivity -= sen_result[current_select][j]
+                    current_sensitivity += sen_result[i][j]
+                    current_bits[j] = i
+                pbar.update(1)
+    node_list = []
+    for i in current_bits:
+        node_list.append(bits_candidate[i])
+    print("Heruistic cost: {:.2f}s".format(time.time() - begin))
     return node_list
 
 
-def plot_bits(bits, name):
+def plot_bits(bits, name, tile_size=None, per_channel=False):
+    if per_channel:
+        xaxis = "channel id"
+        title = "{} per channel".format(name, tile_size)
+        file_name = "workspace/images/{}_bit_per_channel".format(name)
+    elif tile_size is not None:
+        xaxis = "tile id"
+        title = "{} tile size = {}".format(name, tile_size)
+        file_name = "workspace/images/{}_{}B".format(name, tile_size)
+    else:
+        xaxis = "layer id"
+        title = "{}".format(name)
+        file_name = "workspace/images/{}_bit".format(name)
     trace = go.Scatter(y=bits, mode="markers+lines")
     layout = go.Layout(
-        title=name, xaxis=dict(title="size (MB)"), yaxis=dict(title="bits of weight")
+        title=title, xaxis=dict(title=xaxis), yaxis=dict(title="bits of weight")
     )
     data = [trace]
     fig = go.Figure(data, layout)
-    fig.write_image("workspace/images/{}_bit.png".format(name))
-    fig.write_image("workspace/images/{}_bit.pdf".format(name))
+    fig.write_image(file_name + ".png")
+    fig.write_image(file_name + ".pdf")
 
 
 if __name__ == "__main__":
@@ -332,7 +426,7 @@ if __name__ == "__main__":
     print("****** Data loaded ****** cost {:.2f}s".format(time.time() - begin))
     # print("FP model test ...")
     # parallel_model = nn.DataParallel(model).cuda()
-    # test(model, test_loader)
+    # test(parallel_model, test_loader)
     begin = time.time()
     # Quantize single-precision model to 8-bit model
     quan_tool = QuanModel(
@@ -340,18 +434,25 @@ if __name__ == "__main__":
         per_channel=args.per_channel,
         tile_size=args.tile_size,
     )
-    quantized_model = quan_tool.quantize_model(model)
+    quantized_model = quan_tool.quantize_model(model, init_a_bit=32, init_w_bit=32)
     # Freeze BatchNorm statistics
     quantized_model.eval()
     quantized_model = quantized_model.cuda()
+
+    bits_candidate = [2, 3, 4, 5, 6, 7, 8]
+
+    node_list = sensitivity_anylysis(
+        quan_tool.quan_act_layers,
+        quan_tool.quan_weight_layers,
+        dataloader,
+        quantized_model,
+        args,
+        quan_tool.weight_num,
+    )
+
     config = {
         "resnet18": [
             (8, 8),
-            (6, 6),
-            (5, 5),
-            (4, 4),
-            (3, 3),
-            (2, 2),
         ],  # representing MP6 for weights and 6bit for activation
         "resnet50": [(6, 6), (4, 8)],
         "mobilenetv2_w1": [(6, 6), (4, 8)],
@@ -359,12 +460,65 @@ if __name__ == "__main__":
     }
     for (bit_w, bit_a) in config[args.model]:
         begin = time.time()
+
+        bits = node_list
+        plot_bits(
+            bits,
+            "{}_MP{}A{}".format(args.model, bit_w, bit_a),
+            tile_size=args.tile_size,
+            per_channel=args.per_channel,
+        )
+
+        # set weight bits
+        start_idx = 0
+        for i, l in enumerate(quan_tool.quan_weight_layers):
+            if type(l) != Quant_Conv2d:
+                continue
+            l.full_precision_flag = False
+            if args.per_channel:
+                l.bit = bits[start_idx : start_idx + l.out_channels]
+                start_idx += l.out_channels
+            elif args.tile_size is not None:
+                l.bit = bits[start_idx : start_idx + l.tile_nums]
+                start_idx += l.tile_nums
+            else:
+                l.bit = bit_w
+        # set activation bits
         for l in quan_tool.quan_act_layers:
             l.full_precision_flag = False
             l.bit = bit_a
+
+        total_weight_bits = 0
+        max_act_bits = 0
+        # summation total bits
         for i, l in enumerate(quan_tool.quan_weight_layers):
-            l.full_precision_flag = False
-            l.bit = bit_w
+            if type(l) != Quant_Conv2d:
+                continue
+            if args.per_channel:
+                elements_per_out_channel = l.weight[0].numel()
+                for i in range(l.out_channels):
+                    total_weight_bits += l.bit[i] * elements_per_out_channel
+            elif args.tile_size is not None:
+                elements_per_tile = l.elements_per_tile
+                for i in range(l.tile_nums):
+                    total_weight_bits += l.bit[i] * elements_per_tile
+            else:
+                total_weight_bits += l.bit * quan_tool.weight_num[i]
+        for i, l in enumerate(quan_tool.quan_act_layers):
+            max_act_bits = max(max_act_bits, l.bit * l.output_nums)
+
+        # setup for inference
+        for i, l in enumerate(quan_tool.quan_weight_layers):
+            if type(l) != Quant_Conv2d:
+                continue
+            if args.per_channel:
+                l.bit = torch.tensor(l.bit, dtype=torch.float32, device="cuda")
+            elif args.tile_size is not None:
+                l.bit = torch.tensor(l.bit, dtype=torch.float32, device="cuda")
+            else:
+                l.bit = l.bit
+        for i, l in enumerate(quan_tool.quan_act_layers):
+            max_act_bits = max(max_act_bits, l.bit * l.output_nums)
         # Update activation range according to distilled data
         unfreeze_model(quantized_model)
         update(quantized_model, dataloader)
@@ -376,8 +530,13 @@ if __name__ == "__main__":
 
         # Freeze activation range during test
         freeze_model(quantized_model)
-        parallel_quantized_model = nn.DataParallel(quantized_model).cuda()
+        # parallel_quantized_model = nn.DataParallel(quantized_model).cuda()
 
         # Test the final quantized model
-        print("W{}A{}".format(bit_w, bit_a))
-        test(parallel_quantized_model, test_loader)
+        print(
+            "size: W(tot):{:.2f} KiB A(max):{:.2F} KiB Wmp{}A{}".format(
+                total_weight_bits // 8 // 1024, max_act_bits // 8 // 1024, bit_w, bit_a
+            )
+        )
+        # test(parallel_quantized_model, test_loader)
+        test(quantized_model, test_loader)

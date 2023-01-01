@@ -82,7 +82,7 @@ def linear_dequantize(input, scale, zero_point, inplace=False):
     return (input + zero_point) / scale
 
 
-def linear_quantize_channel(input, scale, zero_point, inplace=False):
+def linear_quantize_channel(input, scale, zero_point, k, inplace=False):
     """
     Quantize single-precision input tensor to integers with the given scaling factor and zeropoint.
     input: single-precision input tensor to be quantized
@@ -92,17 +92,25 @@ def linear_quantize_channel(input, scale, zero_point, inplace=False):
 
     # reshape scale and zeropoint for convolutional weights and activation
     if len(input.shape) == 4:
-        scale = scale.unsqueeze(-1).unsqueeze(-1)
-        zero_point = zero_point.unsqueeze(-1).unsqueeze(-1)
+        scale = scale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        zero_point = zero_point.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     # reshape scale and zeropoint for linear weights
     elif len(input.shape) == 2:
         scale = scale.view(-1, 1)
         zero_point = zero_point.view(-1, 1)
     # mapping single-precision input to integer values with the given scale and zeropoint
     if inplace:
-        input.mul_(scale).sub_(zero_point).round_()
-        return input
-    return torch.round(scale * input - zero_point)
+        raise NotImplementedError(
+            "inplace quantization is not supported for tile quantization"
+        )
+        input_tile.mul_(scale).sub_(zero_point).round_()
+        return input_tile
+    result = torch.round(scale * input - zero_point)
+    n = 2 ** (k - 1)
+    if type(n) == torch.Tensor:
+        n = n.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    result = torch.clamp(result, -n, n - 1)
+    return result
 
 
 def linear_dequantize_channel(input, scale, zero_point, inplace=False):
@@ -115,8 +123,8 @@ def linear_dequantize_channel(input, scale, zero_point, inplace=False):
 
     # reshape scale and zeropoint for convolutional weights and activation
     if len(input.shape) == 4:
-        scale = scale.unsqueeze(-1).unsqueeze(-1)
-        zero_point = zero_point.unsqueeze(-1).unsqueeze(-1)
+        scale = scale.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        zero_point = zero_point.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     # reshape scale and zeropoint for linear weights
     elif len(input.shape) == 2:
         scale = scale.view(-1, 1)
@@ -128,7 +136,7 @@ def linear_dequantize_channel(input, scale, zero_point, inplace=False):
     return (input + zero_point) / scale
 
 
-def linear_quantize_tile(input, scale, zero_point, elements_per_tile, inplace=False):
+def linear_quantize_tile(input, scale, zero_point, k, elements_per_tile, inplace=False):
     """
     Quantize single-precision input tensor to integers with the given scaling factor and zeropoint.
     input: single-precision input tensor to be quantized
@@ -162,6 +170,10 @@ def linear_quantize_tile(input, scale, zero_point, elements_per_tile, inplace=Fa
         input_tile.mul_(scale).sub_(zero_point).round_()
         return input_tile
     result_tile = torch.round(scale * input_tile - zero_point)
+    n = 2 ** (k - 1)
+    if type(n) == torch.Tensor:
+        n = n.unsqueeze(-1)
+    result_tile = torch.clamp(result_tile, -n, n - 1)
     # reshape back to original shape
     if len(input.shape) == 4:
         result_tile = result_tile.view(result_tile.shape[0], -1)
@@ -291,15 +303,15 @@ class AsymmetricQuantPerChannelFunction(Function):
             or x_max is None
             or (torch.equal(x_min, x_max) and x_min.numel() == 1)
         ):
-            x_channel_flatten = x.view(x.shape[0], x.shape[1], -1)
+            x_channel_flatten = x.view(x.shape[0] - 1)
             x_min, x_max = (
-                x_channel_flatten.min(dim=2).value,
-                x_channel_flatten.max(dim=2).value,
+                x_channel_flatten.min(dim=1).value,
+                x_channel_flatten.max(dim=1).value,
             )
         scale, zero_point = asymmetric_linear_quantization_params(k, x_min, x_max)
-        new_quant_x = linear_quantize_channel(x, scale, zero_point, inplace=False)
-        n = 2 ** (k - 1)
-        new_quant_x = torch.clamp(new_quant_x, -n, n - 1)
+        new_quant_x = linear_quantize_channel(x, scale, zero_point, k, inplace=False)
+        # n = 2 ** (k - 1)
+        # new_quant_x = torch.clamp(new_quant_x, -n, n - 1)
         quant_x = linear_dequantize_channel(
             new_quant_x, scale, zero_point, inplace=False
         )
@@ -317,7 +329,9 @@ class AsymmetricQuantPerTileFunction(Function):
     """
 
     @staticmethod
-    def forward(ctx, x, k, x_min=None, x_max=None, tile_size=None):
+    def forward(
+        ctx, x, k, x_min=None, x_max=None, tile_size=None, elements_per_tile=None
+    ):
         """
         x: single-precision value to be quantized
         k: bit-setting for x
@@ -330,19 +344,26 @@ class AsymmetricQuantPerTileFunction(Function):
         # feature: NCHW, weight: OIHW
         assert tile_size is not None
         x_flatten = x.view(x.shape[0], -1)
-        elements_per_tile = tile_size * 8 // k
-        padding_elements = elements_per_tile - (x_flatten.shape[1] % elements_per_tile)
+        if elements_per_tile is not None:
+            _elements_per_tile = elements_per_tile
+        elif type(k) == torch.Tensor:
+            _elements_per_tile = tile_size * 8 // torch.max(k).item()
+        else:
+            _elements_per_tile = tile_size * 8 // k
+        padding_elements = _elements_per_tile - (
+            x_flatten.shape[1] % _elements_per_tile
+        )
         if (
             x_min is None
             or x_max is None
             or (torch.equal(x_min, x_max) and x_min.numel() == 1)
         ):
             x_padded = x_flatten
-            if padding_elements != elements_per_tile:
+            if padding_elements != _elements_per_tile:
                 x_padded = torch.nn.functional.pad(
                     x_flatten, (0, padding_elements), "constant", 0
                 )
-            x_padded = x_padded.view(x_padded.shape[0], -1, elements_per_tile)
+            x_padded = x_padded.view(x_padded.shape[0], -1, _elements_per_tile)
 
             x_min, x_max = (
                 x_padded.min(dim=2).value,
@@ -350,12 +371,12 @@ class AsymmetricQuantPerTileFunction(Function):
             )
         scale, zero_point = asymmetric_linear_quantization_params(k, x_min, x_max)
         new_quant_x = linear_quantize_tile(
-            x, scale, zero_point, elements_per_tile, inplace=False
+            x, scale, zero_point, k, _elements_per_tile, inplace=False
         )
-        n = 2 ** (k - 1)
-        new_quant_x = torch.clamp(new_quant_x, -n, n - 1)
+        # n = 2 ** (k - 1)
+        # new_quant_x = torch.clamp(new_quant_x, -n, n - 1)
         quant_x = linear_dequantize_tile(
-            new_quant_x, scale, zero_point, elements_per_tile, inplace=False
+            new_quant_x, scale, zero_point, _elements_per_tile, inplace=False
         )
         return torch.autograd.Variable(quant_x)
 
